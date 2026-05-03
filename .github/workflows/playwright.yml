@@ -1,0 +1,228 @@
+name: Playwright Tests
+
+on:
+  push:
+    branches: [main, master, develop]
+  pull_request:
+    branches: [main, master, develop]
+  # Allow manual runs from the Actions tab
+  workflow_dispatch:
+
+# Cancel in-progress runs of this workflow when a new commit is pushed
+# to the same branch / PR.  Saves CI minutes on rapid iteration.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Playwright auto-enables CI mode (retries: 2, workers: 4) when this is set
+  CI: true
+
+jobs:
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Job 1 — End-to-end UI tests (saucedemo.com)
+  #
+  # Sharded across 2 runners.  Each shard runs ~half the tests.  Blob reports
+  # from each shard are merged into a single HTML report at the end.
+  # ─────────────────────────────────────────────────────────────────────────
+  e2e:
+    name: E2E (chromium, shard ${{ matrix.shard }}/${{ strategy.job-total }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      # ── Cache Playwright browsers across runs ────────────────────────────
+      # Browsers are ~300MB.  Cache key is tied to the installed Playwright
+      # version so an upgrade busts the cache cleanly.
+      - name: Get installed Playwright version
+        id: playwright-version
+        run: |
+          PW_VERSION=$(node -p "require('@playwright/test/package.json').version")
+          echo "version=$PW_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Playwright browsers
+        id: playwright-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ steps.playwright-version.outputs.version }}
+
+      - name: Install Playwright browsers
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
+        run: npx playwright install --with-deps chromium
+
+      # OS-level dependencies are NOT cached, so install them even on cache hit
+      - name: Install Playwright OS dependencies
+        if: steps.playwright-cache.outputs.cache-hit == 'true'
+        run: npx playwright install-deps chromium
+
+      # ── Run the tests ────────────────────────────────────────────────────
+      # The `blob` reporter writes a binary report file that can be merged
+      # with reports from other shards into one unified HTML report.
+      - name: Run E2E tests (shard ${{ matrix.shard }}/${{ strategy.job-total }})
+        run: |
+          npx playwright test tests/e2e \
+            --project=chromium \
+            --shard=${{ matrix.shard }}/${{ strategy.job-total }} \
+            --reporter=blob
+
+      # ── Upload per-shard artifacts ───────────────────────────────────────
+      # Always run — failure artefacts (traces, screenshots) are most useful
+      # exactly when the tests didn't pass.
+      - name: Upload blob report for merging
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: blob-report-e2e-${{ matrix.shard }}
+          path: blob-report
+          retention-days: 7
+
+      - name: Upload test artifacts (traces, screenshots, videos)
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-e2e-shard-${{ matrix.shard }}
+          path: test-results/
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Job 2 — API tests (automationexercise.com)
+  #
+  # Runs in parallel with e2e.  Marked continue-on-error: false so an API
+  # failure DOES block the merge — change to true if AE downtime is too
+  # noisy and you want it informational only.
+  # ─────────────────────────────────────────────────────────────────────────
+  api:
+    name: API tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Get installed Playwright version
+        id: playwright-version
+        run: |
+          PW_VERSION=$(node -p "require('@playwright/test/package.json').version")
+          echo "version=$PW_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Playwright browsers
+        id: playwright-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ steps.playwright-version.outputs.version }}
+
+      - name: Install Playwright browsers
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
+        run: npx playwright install --with-deps chromium
+
+      - name: Install Playwright OS dependencies
+        if: steps.playwright-cache.outputs.cache-hit == 'true'
+        run: npx playwright install-deps chromium
+
+      # ── Run API tests ────────────────────────────────────────────────────
+      - name: Run API tests
+        run: npx playwright test --project=api --reporter=blob
+
+      - name: Upload blob report for merging
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: blob-report-api
+          path: blob-report
+          retention-days: 7
+
+      - name: Upload test artifacts (traces)
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-api
+          path: test-results/
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Job 3 — Merge all blob reports into one unified HTML report
+  #
+  # Runs after both e2e and api jobs, regardless of their pass/fail status,
+  # so failures still produce a viewable report.
+  # ─────────────────────────────────────────────────────────────────────────
+  merge-reports:
+    name: Merge HTML reports
+    if: ${{ !cancelled() }}
+    needs: [e2e, api]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Download all blob reports
+        uses: actions/download-artifact@v4
+        with:
+          path: all-blob-reports
+          pattern: blob-report-*
+          merge-multiple: true
+
+      - name: Merge blob reports into HTML
+        run: npx playwright merge-reports --reporter html ./all-blob-reports
+
+      - name: Upload unified HTML report
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-html-report
+          path: playwright-report
+          retention-days: 30
+
+      # Print the artifact URL in the job summary so reviewers can click
+      # straight to the report from the PR's Checks tab.
+      - name: Add report link to job summary
+        run: |
+          {
+            echo "### 📊 Playwright HTML report"
+            echo ""
+            echo "Download the **playwright-html-report** artifact from the run summary,"
+            echo "extract it, and open \`index.html\` in your browser."
+            echo ""
+            echo "Direct link: <https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}>"
+          } >> "$GITHUB_STEP_SUMMARY"
